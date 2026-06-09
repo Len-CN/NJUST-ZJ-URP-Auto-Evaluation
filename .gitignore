@@ -1,0 +1,30 @@
+# ---- 构建产物 ----
+build/
+dist/
+*.spec
+*.exe
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 运行时临时文件 ----
+.utf8/
+captcha.png
+*.log
+
+# ---- 个人隐私：抓取的真实页面样本（含学号/教师姓名等，禁止公开）----
+1.txt
+*.html
+*_files/
+URP*/
+教学评估*
+
+# ---- IDE ----
+.idea/
+.vscode/
+.DS_Store
