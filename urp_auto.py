@@ -147,6 +147,11 @@ class SangforWebVPN:
                 continue
         return code, attrs.get("msg", "") or re.sub(r"\s+", " ", text)[:120]
 
+    @staticmethod
+    def _b64(text):
+        """与 jquery.base64.encode（utf8encode=true）一致：UTF-8 字节再 Base64。"""
+        return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
     # ---------- 登录 ----------
     def login(self, username, password):
         """登录 VPN 网关，成功后 session 里持有 VSG_SESSIONID。"""
@@ -156,11 +161,16 @@ class SangforWebVPN:
         self.log("正在连接 VPN 网关 %s ..." % self.gateway)
         self._request("GET", "/vpn/theme/auth_home.html",
                       headers={"Referer": self.gateway + "/vpn/theme/auth_home.html"})
+        # jquery.sslvpn.js 的 username_encode 默认 true：账号密码都要 Base64。
+        # 注意：Base64 末尾的 "=" 必须原样发送，不能 URL 编码成 %3D，
+        # 深信服网关按原文解析，编码后会导致 Base64 解不开而报“用户名或密码错误”。
+        body = ("username=" + self._b64(username)
+                + "&password=" + self._b64(password)
+                + "&encode=1&rmbpwd_browser=0")
         r = self._request(
-            "POST", "/vpn/user/auth/password",
-            data={"username": username, "password": password,
-                  "encode": "0", "rmbpwd_browser": "0"},
-            headers={"Referer": self.gateway + "/vpn/theme/auth_home.html",
+            "POST", "/vpn/user/auth/password", data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                     "Referer": self.gateway + "/vpn/theme/auth_home.html",
                      "Origin": self.gateway},
         )
         code, msg = self._parse_result(r)
@@ -254,7 +264,8 @@ class SangforWebVPN:
             except Exception:
                 continue
             html = resp.content.decode("gbk", errors="replace")
-            if ("URP" in html) or ("综合教务系统" in html) or ("loginForm" in html):
+            if ("URP综合教务系统" in html or "清元优软" in html
+                    or ("loginForm" in html and "validateCodeAction" in html)):
                 return True
         return False
 

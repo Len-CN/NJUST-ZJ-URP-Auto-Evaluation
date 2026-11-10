@@ -3,6 +3,7 @@
 
 运行：python tests/test_vpn_flow.py
 """
+import base64
 import os
 import sys
 import threading
@@ -72,8 +73,9 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         data = parse_qs(self.rfile.read(n).decode())
         if path == "/vpn/user/auth/password":
-            user = data.get("username", [""])[0]
-            pwd = data.get("password", [""])[0]
+            user = base64.b64decode(data.get("username", [""])[0]).decode("utf-8")
+            pwd = base64.b64decode(data.get("password", [""])[0]).decode("utf-8")
+            assert data.get("encode") == ["1"], data
             if user == "2415" and pwd == "vpnpwd":
                 body = (b'<?xml version="1.0"?><RESPONSE><RESULT code="0" msg="ok" '
                         b'sid_name="VSG_SESSIONID"/></RESPONSE>')
