@@ -103,6 +103,12 @@ python urp_auto.py --selftest
 
 会打印解析到的题目、所选答案、防作弊校验是否通过、课程列表等。
 
+VPN 网页模式另有本地 mock 网关测试（不联网、不需要真实账号）：
+
+```bash
+python tests/test_vpn_flow.py
+```
+
 ## 常见问题
 
 - **验证码总是错**：ddddocr 并非 100% 准确，多点几次"刷新验证码"或手动输入即可。
