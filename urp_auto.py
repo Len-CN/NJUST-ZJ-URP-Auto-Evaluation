@@ -14,6 +14,10 @@
 
 编码：全站 GBK。所有请求体用 GBK 百分号编码，所有响应用 GBK 解码（关键！）。
 
+校外访问：内置深信服 SSL VPN 网页模式（SangforWebVPN）。登录 VPN 网关后
+          解析 intergration.xml 资源列表，把教务系统映射成 https://网关/<mapid>/，
+          URPClient 复用 VPN 的 session（VSG_SESSIONID）即可照常访问。
+
 选项策略：每题取 id=1（"非常同意"，分值最高 _1）。
 防作弊：页面 JS check() 用 max(选中id)-min(选中id)==0 拦截"全部一样"。
         直接 POST 虽可绕过客户端 JS，但为防服务端同样校验，默认把最后 1 题改选
@@ -23,16 +27,24 @@
 import sys
 import re
 import time
+import base64
 import random
 import threading
 import queue
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 try:
     import requests
 except ImportError:
     print("缺少依赖 requests，请先运行: pip install requests")
     raise
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 
 # ------- 可选依赖：验证码自动识别 -------
 try:
@@ -53,6 +65,11 @@ except Exception:
 
 DEFAULT_SERVER = "http://192.168.16.207"
 
+# 校外访问：学校深信服 SSL VPN 网页网关（WebVPN 模式）
+DEFAULT_VPN_GATEWAY = "https://223.112.21.198:6443"
+# 在 VPN 已授权资源里按名称关键字找教务系统
+DEFAULT_VPN_RESOURCE_KEYWORD = "教务"
+
 # 主观评价模板（均 < 100 字，符合 zgpj 长度限制；逐课轮换，避免完全雷同）
 SUBJECTIVE_TEMPLATES = [
     "老师授课认真负责，内容充实，讲解清晰易懂，注重课堂互动，关心学生成长，让我受益匪浅，感谢老师的辛勤付出！",
@@ -71,19 +88,205 @@ class URPError(Exception):
     pass
 
 
-class URPClient:
-    """与 URP 服务器交互的核心客户端（不含界面）。"""
+class VPNError(URPError):
+    """VPN 网关登录、资源解析失败。"""
 
-    def __init__(self, base_url=DEFAULT_SERVER, log=log_noop):
-        self.base = base_url.rstrip("/")
+
+class SangforWebVPN:
+    """深信服 SSL VPN 网页模式（WebVPN）客户端。
+
+    协议复刻自网关自带的 jquery.sslvpn.js：
+      1. GET  /vpn/theme/auth_home.html                 建立初始会话
+      2. POST /vpn/user/auth/password                   账号密码登录
+         data: username / password / encode=0 / rmbpwd_browser=0
+         响应: <RESPONSE><RESULT code="..." msg="..."/></RESPONSE>，code=0 即成功
+      3. GET  /vpn/user/portal/intergration.xml?version=1.0
+         响应: <RESOURCE_LIST><WEB_RESOURCE mapid="..." uri="base64路径" name="..."/>
+      4. 资源地址 = 网关 + "/" + mapid + base64解码(uri)
+         例：https://223.112.21.198:6443/<mapid>/
+
+    登录成功后拿到的 VSG_SESSIONID Cookie 同时用于访问被代理的 URP，
+    所以 URPClient 必须复用本类的 session。
+    """
+
+    def __init__(self, gateway=DEFAULT_VPN_GATEWAY, log=log_noop):
+        self.gateway = (gateway or "").strip().rstrip("/")
+        if not self.gateway:
+            raise VPNError("VPN 网关地址不能为空")
         self.log = log
         self.s = requests.Session()
         self.s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/120.0 Safari/537.36",
+            "X-Requested-With": "XMLHttpRequest",
         })
+        # 网关是自签证书
+        self.s.verify = False
+        self.resources = []
+
+    # ---------- 基础请求 ----------
+    def _request(self, method, path, **kw):
+        kw.setdefault("timeout", 20)
+        kw.setdefault("verify", False)
+        return self.s.request(method, self.gateway + path, **kw)
+
+    @staticmethod
+    def _parse_result(resp):
+        """解析 <RESULT code="0x..." msg="..."/>，返回 (code, msg)。"""
+        text = resp.content.decode("utf-8", errors="replace")
+        m = re.search(r"<RESULT\b([^>]*?)/?>", text, re.I)
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1))) if m else {}
+        raw = attrs.get("code", "")
+        code = None
+        for conv in (lambda v: int(v, 0), lambda v: int(v, 16), lambda v: int(v)):
+            try:
+                code = conv(raw.strip())
+                break
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return code, attrs.get("msg", "") or re.sub(r"\s+", " ", text)[:120]
+
+    @staticmethod
+    def _b64(text):
+        """与 jquery.base64.encode（utf8encode=true）一致：UTF-8 字节再 Base64。"""
+        return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+    # ---------- 登录 ----------
+    def login(self, username, password):
+        """登录 VPN 网关，成功后 session 里持有 VSG_SESSIONID。"""
+        username = (username or "").strip()
+        if not username or not password:
+            raise VPNError("请填写 VPN 账号和密码")
+        self.log("正在连接 VPN 网关 %s ..." % self.gateway)
+        self._request("GET", "/vpn/theme/auth_home.html",
+                      headers={"Referer": self.gateway + "/vpn/theme/auth_home.html"})
+        # jquery.sslvpn.js 的 username_encode 默认 true：账号密码都要 Base64。
+        # 注意：Base64 末尾的 "=" 必须原样发送，不能 URL 编码成 %3D，
+        # 深信服网关按原文解析，编码后会导致 Base64 解不开而报“用户名或密码错误”。
+        body = ("username=" + self._b64(username)
+                + "&password=" + self._b64(password)
+                + "&encode=1&rmbpwd_browser=0")
+        r = self._request(
+            "POST", "/vpn/user/auth/password", data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                     "Referer": self.gateway + "/vpn/theme/auth_home.html",
+                     "Origin": self.gateway},
+        )
+        code, msg = self._parse_result(r)
+        if code == 0:
+            self.log("VPN 登录成功。")
+            return True
+        if code == 0x80000012:
+            raise VPNError("VPN 网关要求输入验证码。请先在浏览器登录一次 %s，成功后回来重试"
+                           % self.gateway)
+        raise VPNError("VPN 登录失败：%s%s" % (
+            msg or "未知错误",
+            "（code=0x%08X）" % code if isinstance(code, int) and code >= 0 else ""))
+
+    # ---------- 资源列表 ----------
+    @staticmethod
+    def parse_resources(xml_text, gateway):
+        """解析 intergration.xml 的 WEB_RESOURCE 列表。"""
+        root = ET.fromstring(xml_text)
+        resources = []
+        for web in root.iter("WEB_RESOURCE"):
+            mapid = (web.get("mapid") or "").strip()
+            if not mapid:
+                continue
+            try:
+                uri = base64.b64decode(web.get("uri") or "").decode("utf-8", "replace")
+            except Exception:
+                uri = ""
+            if not uri.startswith("/"):
+                uri = "/" + uri
+            resources.append({
+                "name": web.get("name") or "",
+                "mapid": mapid,
+                "uri": uri,
+                "status": web.get("status") or "",
+                "authority": web.get("authority") or "",
+                "base": "%s/%s%s" % (gateway.rstrip("/"), mapid, uri),
+            })
+        return resources
+
+    def get_web_resources(self):
+        r = self._request("GET", "/vpn/user/portal/intergration.xml?version=1.0")
+        text = r.content.decode("utf-8", errors="replace")
+        if "<RESOURCE_LIST" not in text:
+            raise VPNError("获取 VPN 资源列表失败：登录会话无效或已过期")
+        try:
+            self.resources = self.parse_resources(text, self.gateway)
+        except ET.ParseError as e:
+            raise VPNError("解析 VPN 资源列表失败：%s" % e)
+        return self.resources
+
+    @staticmethod
+    def _int_attr(value):
+        try:
+            return int(str(value), 0)
+        except (TypeError, ValueError):
+            try:
+                return int(str(value))
+            except (TypeError, ValueError):
+                return 0
+
+    def find_urp_base(self, keyword=DEFAULT_VPN_RESOURCE_KEYWORD):
+        """在已授权资源里定位教务系统，返回 (base_url, resource)。
+
+        先按名称关键字筛选，再逐个探测是否真是 URP 登录页，
+        避免选到同名但指向其它服务器的资源。
+        """
+        resources = self.get_web_resources()
+        candidates = [
+            r for r in resources
+            if self._int_attr(r["status"]) == 1
+            and self._int_attr(r["authority"]) not in (0, 3)
+        ]
+        named = [r for r in candidates if keyword and keyword in r["name"]]
+        if named:
+            candidates = named
+        if not candidates:
+            raise VPNError("VPN 里没有找到可用的教务系统资源（共 %d 个资源）" % len(resources))
+        for r in candidates:
+            if self._looks_like_urp(r["base"]):
+                self.log("已定位教务系统：%s" % r["name"])
+                return r["base"], r
+        r = candidates[0]
+        self.log("未能确认资源类型，按名称选用：%s" % r["name"])
+        return r["base"], r
+
+    def _looks_like_urp(self, base):
+        """探测资源根路径是否为 URP 登录页。"""
+        for path in ("/", "/loginAction.do"):
+            try:
+                resp = self.s.get(base.rstrip("/") + path, timeout=15, verify=False)
+            except Exception:
+                continue
+            html = resp.content.decode("gbk", errors="replace")
+            if ("URP综合教务系统" in html or "清元优软" in html
+                    or ("loginForm" in html and "validateCodeAction" in html)):
+                return True
+        return False
+
+
+class URPClient:
+    """与 URP 服务器交互的核心客户端（不含界面）。"""
+
+    def __init__(self, base_url=DEFAULT_SERVER, log=log_noop, session=None):
+        self.base = base_url.rstrip("/")
+        self.log = log
+        # WebVPN 模式下必须传入 VPN 的 session，才能带上 VSG_SESSIONID
+        self.s = session if session is not None else requests.Session()
+        if session is None:
+            self.s.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0 Safari/537.36",
+            })
         self.zjh = ""
+        # WebVPN 的 base 形如 https://网关/<mapid>，重定向时要把这段前缀补回去
+        self.base_path = urllib.parse.urlparse(self.base).path.rstrip("/")
 
     # ---------- 基础工具 ----------
     def _url(self, path):
@@ -91,15 +294,50 @@ class URPClient:
             return path
         return self.base + path
 
+    def _request(self, method, path, **kw):
+        """发请求。WebVPN 模式下手动跟随重定向并修正 Location 前缀。
+
+        站内跳转常返回 `/jxpgXsAction.do` 这类站根路径，直连时没问题；
+        但经 VPN 网关时必须改写成 `/<mapid>/jxpgXsAction.do`，否则会跑到网关根目录。
+        """
+        url = self._url(path)
+        kw.setdefault("timeout", 30)
+        if not self.base_path:
+            kw.setdefault("allow_redirects", True)
+            return self.s.request(method, url, **kw)
+
+        kw["allow_redirects"] = False
+        resp = self.s.request(method, url, **kw)
+        hops = 0
+        while resp.is_redirect and hops < 5:
+            loc = resp.headers.get("Location", "")
+            if loc.startswith("http"):
+                loc_parsed = urllib.parse.urlparse(loc)
+                base_parsed = urllib.parse.urlparse(self.base)
+                if loc_parsed.netloc and loc_parsed.netloc != base_parsed.netloc:
+                    # 服务端返回内网绝对地址：只保留 path/query，再补 VPN 前缀
+                    loc = loc_parsed.path + (("?" + loc_parsed.query) if loc_parsed.query else "")
+            if loc.startswith("/") and not loc.startswith(self.base_path + "/"):
+                loc = self.base_path + loc
+            nxt = urllib.parse.urljoin(resp.url, loc)
+            if resp.status_code in (307, 308):
+                retry_kw = dict(kw)
+                retry_kw.pop("allow_redirects", None)
+                resp = self.s.request(method, nxt, allow_redirects=False, **retry_kw)
+            else:
+                resp = self.s.get(nxt, timeout=kw.get("timeout", 30),
+                                  allow_redirects=False)
+            hops += 1
+        return resp
+
     def _get(self, path, **kw):
-        return self.s.get(self._url(path), timeout=30, **kw)
+        return self._request("GET", path, **kw)
 
     def _post_gbk(self, path, pairs):
         """以 GBK 百分号编码提交表单，pairs 为 (key, value) 列表以保持顺序。"""
         body = urllib.parse.urlencode(pairs, encoding="gbk")
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        return self.s.post(self._url(path), data=body, headers=headers,
-                           timeout=30, allow_redirects=True)
+        return self._request("POST", path, data=body, headers=headers)
 
     @staticmethod
     def _text_gbk(resp):
@@ -136,6 +374,9 @@ class URPClient:
         ]
         r = self._post_gbk("/loginAction.do", pairs)
         html = self._text_gbk(r)
+        # VPN 会话过期时，网关会直接返回自己的登录页
+        if "/vpn/theme/auth_home" in html or "jquery.sslvpn.js" in html:
+            raise URPError("VPN 网关会话已过期，请重新点『连接 VPN』")
         # 失败特征
         if "密码不正确" in html or "帐号不存在" in html or "账号不存在" in html:
             raise URPError("学号或密码错误")
@@ -395,6 +636,25 @@ def selftest():
             print("  %s | 老师=%s | 课程=%s" % (parts[0], parts[2], parts[4]))
     else:
         print("未找到本地列表文件，跳过。")
+
+    print("\n=== 自测：VPN 资源列表解析 ===")
+    sample_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<RESPONSE>
+  <RESOURCE_LIST>
+    <WEB_RESOURCE mapid="0123abcd" uri="Lw==" name="教务系统1" status="1" authority="1" display="1"/>
+    <WEB_RESOURCE mapid="deadbeef" uri="L3N5cy8=" name="其它系统" status="1" authority="1" display="1"/>
+    <WEB_RESOURCE mapid="00000000" uri="Lw==" name="无权限资源" status="1" authority="0" display="1"/>
+  </RESOURCE_LIST>
+</RESPONSE>'''
+    try:
+        rs = SangforWebVPN.parse_resources(sample_xml, "https://vpn.example.edu.cn/")
+        for r in rs:
+            print("  资源 %-8s -> %s" % (r["name"], r["base"]))
+        ok = (rs[0]["base"] == "https://vpn.example.edu.cn/0123abcd/"
+              and rs[1]["base"] == "https://vpn.example.edu.cn/deadbeef/sys/")
+        print("资源地址拼接:", "OK" if ok else "❌ 不正确")
+    except Exception as e:
+        print("解析异常:", e)
     print("\n自测完成。")
 
 
@@ -407,7 +667,7 @@ def run_gui():
 
     root = tk.Tk()
     root.title("紫金 URP 自动评估软件")
-    root.geometry("760x640")
+    root.geometry("820x790")
 
     log_q = queue.Queue()
 
@@ -416,7 +676,7 @@ def run_gui():
 
     client = URPClient(log=gui_log)
     state = {"captcha_img": None, "logged_in": False, "stop": False,
-             "running": False}
+             "running": False, "vpn": None, "vpn_connected": False}
 
     # ---------- 顶部：连接与账号 ----------
     frm = ttk.Frame(root, padding=10)
@@ -444,6 +704,57 @@ def run_gui():
     ocr_hint = "自动识别:开" if HAS_OCR else "自动识别:未安装(手动输入)"
     ttk.Label(frm, text=ocr_hint, foreground=("green" if HAS_OCR else "red")).grid(
         row=2, column=3, sticky="w")
+
+    # ---------- 网络访问（校外） ----------
+    net = ttk.LabelFrame(root, text="网络访问（校外）", padding=10)
+    net.pack(fill="x", padx=10, pady=(6, 0))
+
+    ttk.Label(net, text="访问方式").grid(row=0, column=0, sticky="w")
+    mode_var = tk.StringVar(value="校园网直连")
+    mode_box = ttk.Combobox(net, textvariable=mode_var, state="readonly",
+                            values=("校园网直连", "VPN 网页模式"), width=14)
+    mode_box.grid(row=0, column=1, sticky="w", padx=4, pady=3)
+
+    ttk.Label(net, text="代理（可选）").grid(row=0, column=2, sticky="e")
+    proxy_var = tk.StringVar()
+    ttk.Entry(net, textvariable=proxy_var, width=28).grid(
+        row=0, column=3, sticky="w", padx=4, pady=3)
+
+    ttk.Label(net, text="VPN 网关").grid(row=1, column=0, sticky="w")
+    vpn_gw_var = tk.StringVar(value=DEFAULT_VPN_GATEWAY)
+    vpn_gw_entry = ttk.Entry(net, textvariable=vpn_gw_var, width=42)
+    vpn_gw_entry.grid(row=1, column=1, columnspan=2, sticky="w", padx=4, pady=3)
+    btn_vpn = ttk.Button(net, text="连接 VPN", width=10)
+    btn_vpn.grid(row=1, column=3, sticky="w", padx=4)
+
+    ttk.Label(net, text="VPN 账号").grid(row=2, column=0, sticky="w")
+    vpn_user_var = tk.StringVar()
+    vpn_user_entry = ttk.Entry(net, textvariable=vpn_user_var, width=24)
+    vpn_user_entry.grid(row=2, column=1, sticky="w", padx=4, pady=3)
+
+    ttk.Label(net, text="VPN 密码").grid(row=2, column=2, sticky="e")
+    vpn_pwd_var = tk.StringVar()
+    vpn_pwd_entry = ttk.Entry(net, textvariable=vpn_pwd_var, width=24, show="*")
+    vpn_pwd_entry.grid(row=2, column=3, sticky="w", padx=4, pady=3)
+
+    vpn_hint = ttk.Label(net, text="VPN 账号密码只用于登录网关，不会保存", foreground="gray")
+    vpn_hint.grid(row=3, column=0, columnspan=4, sticky="w")
+
+    vpn_widgets = (vpn_gw_entry, vpn_user_entry, vpn_pwd_entry, btn_vpn)
+
+    def update_net_widgets(*_):
+        vpn_mode = mode_var.get().startswith("VPN")
+        st = "normal" if vpn_mode else "disabled"
+        for w in vpn_widgets:
+            w.config(state=st)
+        vpn_hint.config(foreground=("gray" if vpn_mode else "#bbb"))
+        if not vpn_mode:
+            state["vpn_connected"] = False
+            # 从 VPN 模式切回直连时，恢复默认内网地址
+            if server_var.get().strip().startswith(vpn_gw_var.get().strip().rstrip("/")):
+                server_var.set(DEFAULT_SERVER)
+
+    mode_box.bind("<<ComboboxSelected>>", update_net_widgets)
 
     # ---------- 中部：策略设置 ----------
     opt = ttk.LabelFrame(root, text="评估设置", padding=10)
@@ -476,7 +787,7 @@ def run_gui():
     btn_stop.pack(side="left")
 
     # ---------- 日志 ----------
-    logbox = tk.Text(root, height=18, wrap="word", state="disabled", bg="#111", fg="#ddd")
+    logbox = tk.Text(root, height=14, wrap="word", state="disabled", bg="#111", fg="#ddd")
     logbox.pack(fill="both", expand=True, padx=10, pady=8)
 
     def drain_log():
@@ -491,9 +802,56 @@ def run_gui():
             pass
         root.after(150, drain_log)
 
+    # ---------- 网络设置 ----------
+    def apply_server():
+        client.base = server_var.get().strip().rstrip("/")
+        client.base_path = urllib.parse.urlparse(client.base).path.rstrip("/")
+
+    def apply_proxy():
+        p = proxy_var.get().strip()
+        if p:
+            client.s.proxies.update({"http": p, "https": p})
+        else:
+            client.s.proxies.clear()
+
+    def connect_vpn_blocking():
+        """登录 VPN 并把服务器地址切到网关映射地址（阻塞，需在子线程调用）。"""
+        vpn = SangforWebVPN(vpn_gw_var.get(), log=gui_log)
+        vpn.login(vpn_user_var.get(), vpn_pwd_var.get())
+        base, res = vpn.find_urp_base()
+        client.s = vpn.s
+        server_var.set(base)
+        apply_server()
+        apply_proxy()
+        state["vpn"] = vpn
+        state["vpn_connected"] = True
+        gui_log("✅ VPN 已就绪：%s" % res["name"])
+        gui_log("   服务器地址已自动切换为：%s" % base)
+
+    def do_connect_vpn():
+        if state["running"]:
+            return
+        btn_vpn.config(state="disabled")
+        gui_log("开始连接 VPN ...")
+
+        def worker():
+            try:
+                connect_vpn_blocking()
+                root.after(0, refresh_captcha)
+            except Exception as e:
+                state["vpn_connected"] = False
+                gui_log("❌ VPN 连接失败：%s" % e)
+            finally:
+                normal = mode_var.get().startswith("VPN")
+                root.after(0, lambda: btn_vpn.config(state=("normal" if normal else "disabled")))
+        threading.Thread(target=worker, daemon=True).start()
+
     # ---------- 验证码 ----------
     def refresh_captcha():
-        client.base = server_var.get().strip().rstrip("/")
+        if mode_var.get().startswith("VPN") and not state["vpn_connected"]:
+            gui_log("请先点『连接 VPN』完成网关登录。")
+            return
+        apply_server()
         try:
             img = client.fetch_captcha()
         except Exception as e:
@@ -527,7 +885,7 @@ def run_gui():
                 pass
 
     def do_login():
-        client.base = server_var.get().strip().rstrip("/")
+        apply_server()
         if not zjh_var.get().strip() or not mm_var.get():
             messagebox.showwarning("提示", "请填写学号和密码")
             return
@@ -537,6 +895,9 @@ def run_gui():
 
         def worker():
             try:
+                if mode_var.get().startswith("VPN") and not state["vpn_connected"]:
+                    connect_vpn_blocking()
+                apply_proxy()
                 gui_log("正在登录...")
                 client.login(zjh_var.get(), mm_var.get(), yzm_var.get())
                 state["logged_in"] = True
@@ -560,6 +921,8 @@ def run_gui():
             return
         if state["running"]:
             return
+        apply_server()
+        apply_proxy()
         state["stop"] = False
         state["running"] = True
         btn_run.config(state="disabled")
@@ -589,9 +952,12 @@ def run_gui():
     btn_login.config(command=do_login)
     btn_run.config(command=do_run)
     btn_stop.config(command=do_stop)
+    btn_vpn.config(command=do_connect_vpn)
+    update_net_widgets()
 
     gui_log("欢迎使用紫金 URP 自动评估软件。")
     gui_log("步骤：① 填学号密码 ② 点『刷新验证码』(自动识别会预填) ③ 点『登录』 ④ 点『开始自动评估』。")
+    gui_log("校外使用：访问方式选『VPN 网页模式』，填 VPN 账号密码后点『连接 VPN』，地址会自动切换。")
     if not HAS_OCR:
         gui_log("提示：未安装 ddddocr，验证码需手动输入（看右侧小图）。装上可自动识别：pip install ddddocr")
     drain_log()
